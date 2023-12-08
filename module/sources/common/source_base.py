@@ -712,7 +712,7 @@ class SourceBase:
             re.sub('-+', '-', data.get("name").replace("_", "-")).strip("-"), 100)[0:50].replace("-", "_")
 
         # edited by lucas
-        if data['name'].includes('__'):
+        if '__' in data['name']:
             data['name'] = data["name"].replace('__', '_')
         # end edit
 
