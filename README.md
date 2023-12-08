@@ -2,7 +2,7 @@
 # NetBox-Sync
 
 -----
-This is a fork of [this](https://github.com/bb-Ricardo/netbox-sync) project with little customizations
+This is a fork of [this](https://github.com/bb-Ricardo/netbox-sync) project with small customizations
 -----
 
 This is a tool to sync data from different sources to a NetBox instance.
