@@ -711,6 +711,11 @@ class SourceBase:
         data["name"] = NetBoxObject.format_slug(
             re.sub('-+', '-', data.get("name").replace("_", "-")).strip("-"), 100)[0:50].replace("-", "_")
 
+        # edited by lucas
+        if data['name'].includes('__'):
+            data['name'] = data["name"].replace('__', '_')
+        # end edit
+
         custom_field = self.inventory.get_by_data(NBCustomField, data={"name": data.get("name")})
 
         if custom_field is None:
