@@ -15,8 +15,9 @@ from module.config import source_config_section_name
 from module.config.base import ConfigBase
 from module.config.option import ConfigOption
 from module.config.group import ConfigOptionGroup
-from module.sources.common.conifg import *
+from module.sources.common.config import *
 from module.sources.common.permitted_subnets import PermittedSubnets
+from module.sources.common.excluded_vlan import ExcludedVLANID, ExcludedVLANName
 from module.common.logging import get_logger
 from module.common.support import normalize_mac_address
 
@@ -121,9 +122,13 @@ class VMWareConfig(ConfigBase):
                                              address it is important to pick the correct site.
                                              A VM always depends on the cluster site relation
                                              a cluster can be specified as "Cluster-name" or
-                                             "Datacenter-name/Cluster-name" if multiple clusters have the same name
+                                             "Datacenter-name/Cluster-name" if multiple clusters have the same name.
+                                             When a vCenter cluster consists of hosts from multiple NetBox sites,
+                                             it is possible to leave the site for a NetBox cluster empty. All VMs from
+                                             this cluster will then also have no site reference.
+                                             The keyword "<NONE>" can be used as a value for this.
                                              """,
-                                             config_example="Cluster_NYC = New York, Cluster_FFM.* = Frankfurt, Datacenter_TOKIO/.* = Tokio"),
+                                             config_example="Cluster_NYC = New York, Cluster_FFM.* = Frankfurt, Datacenter_TOKIO/.* = Tokio, Cluster_MultiSite = <NONE>"),
                                 ConfigOption("host_site_relation",
                                              str,
                                              description="""Same as cluster site but on host level.
@@ -298,10 +303,24 @@ class VMWareConfig(ConfigBase):
                          which are only visible inside the VM and are exposed through VM guest tools.
                          Dummy interfaces without an IP address will be skipped.""",
                          default_value=False),
-            ConfigOption("disable_vlan_sync",
-                         bool,
-                         description="disables syncing of any VLANs visible in vCenter to NetBox",
-                         default_value=False),
+            ConfigOptionGroup(title="VLAN syncing",
+                              description="""\
+                              These options control if VLANs are sync to NetBox or if some VLANs are excluded from sync.
+                              The exclude options can contain the site name as well (site-name/vlan). Site names and VLAN
+                              names can be regex expressions. VLAN IDs can be single IDs or ranges.
+                              """,
+                              options=[
+                                  ConfigOption("disable_vlan_sync",
+                                               bool,
+                                               description="disables syncing of any VLANs visible in vCenter to NetBox",
+                                               default_value=False),
+                                  ConfigOption("vlan_sync_exclude_by_name",
+                                               str,
+                                               config_example="New York/Storage, Backup, Tokio/DMZ, Madrid/.*"),
+                                  ConfigOption("vlan_sync_exclude_by_id",
+                                               str,
+                                               config_example="Frankfurt/25, 1023-1042"),
+                              ]),
             ConfigOption("track_vm_host",
                          bool,
                          description="""enabling this option will add the ESXi host
@@ -316,6 +335,16 @@ class VMWareConfig(ConfigBase):
                          bool,
                          description="""define if the name of the VM interface discovered overwrites the
                          interface name in NetBox. The interface will only be matched by identical MAC address""",
+                         default_value=True),
+            ConfigOption("overwrite_device_platform",
+                         bool,
+                         description="""define if the platform of the device discovered overwrites the device
+                         platform in NetBox.""",
+                         default_value=True),
+            ConfigOption("overwrite_vm_platform",
+                         bool,
+                         description="""define if the platform of the VM discovered overwrites the VM
+                         platform in NetBox.""",
                          default_value=True),
             ConfigOption("host_management_interface_match",
                          str,
@@ -510,6 +539,38 @@ class VMWareConfig(ConfigBase):
                 option.set_value(quoted_split(option.value))
 
                 continue
+
+            if option.key == "vlan_sync_exclude_by_name":
+
+                value_list = list()
+
+                for excluded_vlan in quoted_split(option.value) or list():
+
+                    excluded_vlan_object = ExcludedVLANName(excluded_vlan)
+
+                    if not excluded_vlan_object.is_valid():
+                        self.set_validation_failed()
+                        continue
+
+                    value_list.append(excluded_vlan_object)
+
+                option.set_value(value_list)
+
+            if option.key == "vlan_sync_exclude_by_id":
+
+                value_list = list()
+
+                for excluded_vlan in quoted_split(option.value) or list():
+
+                    excluded_vlan_object = ExcludedVLANID(excluded_vlan)
+
+                    if not excluded_vlan_object.is_valid():
+                        self.set_validation_failed()
+                        continue
+
+                    value_list.append(excluded_vlan_object)
+
+                option.set_value(value_list)
 
         permitted_subnets_option = self.get_option_by_name("permitted_subnets")
 

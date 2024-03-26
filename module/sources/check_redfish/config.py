@@ -12,7 +12,7 @@ import os
 from module.config import source_config_section_name
 from module.config.base import ConfigBase
 from module.config.option import ConfigOption
-from module.sources.common.conifg import *
+from module.sources.common.config import *
 from module.common.logging import get_logger
 from module.common.misc import quoted_split
 from module.sources.common.permitted_subnets import PermittedSubnets
@@ -68,7 +68,7 @@ class CheckRedfishConfig(ConfigBase):
                          bool,
                          description="""define if existing interface attributes are overwritten with data discovered
                          via check_redfish if False only data which is not preset in NetBox will be added""",
-                         default_value=True),
+                         default_value=False),
 
             ConfigOption(**config_option_ip_tenant_inheritance_order_definition),
         ]
@@ -80,17 +80,24 @@ class CheckRedfishConfig(ConfigBase):
         for option in self.options:
 
             if option.key == "inventory_file_path":
+                if option.value is None:
+                    self.set_validation_failed()
+                    continue
+
                 if not os.path.exists(option.value):
                     log.error(f"Inventory file path '{option.value}' not found.")
                     self.set_validation_failed()
+                    continue
 
                 if os.path.isfile(option.value):
                     log.error(f"Inventory file path '{option.value}' needs to be a directory.")
                     self.set_validation_failed()
+                    continue
 
                 if not os.access(option.value, os.X_OK | os.R_OK):
                     log.error(f"Inventory file path '{option.value}' not readable.")
                     self.set_validation_failed()
+                    continue
 
             if option.key == "ip_tenant_inheritance_order":
                 option.set_value(quoted_split(option.value))

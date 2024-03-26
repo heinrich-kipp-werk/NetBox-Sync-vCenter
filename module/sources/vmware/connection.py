@@ -12,9 +12,11 @@ import pprint
 import ssl
 from ipaddress import ip_address, ip_interface
 from urllib.parse import unquote
+from itertools import zip_longest
 
 import urllib3
 import requests
+import http
 # noinspection PyUnresolvedReferences
 from packaging import version
 # noinspection PyUnresolvedReferences
@@ -69,7 +71,8 @@ class VMWareHandler(SourceBase):
         NBTenant,
         NBVRF,
         NBVLAN,
-        NBCustomField
+        NBCustomField,
+        NBVirtualDisk
     ]
 
     source_type = "vmware"
@@ -346,7 +349,7 @@ class VMWareHandler(SourceBase):
             # test if session is still alive
             try:
                 self.session.sessionManager.currentSession.key
-            except (vim.fault.NotAuthenticated, AttributeError):
+            except (vim.fault.NotAuthenticated, AttributeError, http.client.RemoteDisconnected):
                 log.info("No existing vCenter session found.")
                 self.session = None
                 self.tag_session = None
@@ -477,6 +480,11 @@ class VMWareHandler(SourceBase):
         if site_name is None:
             site_name = self.site_name
             log.debug(f"No site relation for '{object_name}' found, using default site '{site_name}'")
+
+        # set the site for cluster to None if None-keyword ("<NONE>") is set via cluster_site_relation
+        if object_type == NBCluster and site_name == "<NONE>":
+            site_name = None
+            log.debug2(f"Site relation for '{object_name}' set to None")
 
         return site_name
 
@@ -677,6 +685,12 @@ class VMWareHandler(SourceBase):
                     continue
 
                 if tag_name is not None:
+
+                    if tag_description is not None and len(f"{tag_description}") > 0:
+                        tag_description = f"{primary_tag_name}: {tag_description}"
+                    else:
+                        tag_description = primary_tag_name
+
                     tag_list.append(self.inventory.add_update_object(NBTag, data={
                         "name": tag_name,
                         "description": tag_description
@@ -822,6 +836,8 @@ class VMWareHandler(SourceBase):
             if label is None:
                 continue
 
+            label = label.strip('"')
+
             if self.settings.custom_attribute_exclude is not None and \
                     label in self.settings.custom_attribute_exclude:
                 log.debug(f"Custom attribute '{label}' excluded from sync. Skipping")
@@ -929,7 +945,7 @@ class VMWareHandler(SourceBase):
             return resolved_name
 
     def add_device_vm_to_inventory(self, object_type, object_data, pnic_data=None, vnic_data=None,
-                                   nic_ips=None, p_ipv4=None, p_ipv6=None, vmware_object=None):
+                                   nic_ips=None, p_ipv4=None, p_ipv6=None, vmware_object=None, disk_data=None):
         """
         Add/update device/VM object in inventory based on gathered data.
 
@@ -990,6 +1006,8 @@ class VMWareHandler(SourceBase):
             primary IPv6 as string including netmask/prefix
         vmware_object: (vim.HostSystem, vim.VirtualMachine)
             vmware object to pass on to 'add_update_interface' method to setup reevaluation
+        disk_data: list
+            data of discs which belong to a VM
 
         """
 
@@ -1006,6 +1024,7 @@ class VMWareHandler(SourceBase):
             pprint.pprint(nic_ips)
             pprint.pprint(p_ipv4)
             pprint.pprint(p_ipv6)
+            pprint.pprint(disk_data)
 
         # check existing Devices for matches
         log.debug2(f"Trying to find a {object_type.name} based on the collected name, cluster, IP and MAC addresses")
@@ -1059,6 +1078,15 @@ class VMWareHandler(SourceBase):
             log.debug(f"No existing {object_type.name} object for {object_name}. Creating a new {object_type.name}.")
             device_vm_object = self.inventory.add_object(object_type, data=object_data, source=self)
         else:
+
+            if object_type == NBVM and self.settings.overwrite_vm_platform is False and \
+                    object_data.get("platform") is not None:
+                del object_data["platform"]
+
+            if object_type == NBDevice and self.settings.overwrite_device_platform is False and \
+                    object_data.get("platform") is not None:
+                del object_data["platform"]
+
             device_vm_object.update(data=object_data, source=self)
 
         # add object to cache
@@ -1069,12 +1097,47 @@ class VMWareHandler(SourceBase):
         role_name = self.get_object_relation(object_name,
                                              "host_role_relation" if object_type == NBDevice else "vm_role_relation")
 
+        # take care of object role in NetBox
         if object_type == NBDevice:
             if role_name is None:
                 role_name = "Server"
             device_vm_object.update(data={"device_role": {"name": role_name}})
         if object_type == NBVM and role_name is not None:
             device_vm_object.update(data={"role": {"name": role_name}})
+
+        # verify if source tags have been removed from object.
+        new_object_tags = list(map(NetBoxObject.extract_tag_name, object_data.get("tags", list())))
+
+        for object_tag in device_vm_object.data.get("tags", list()):
+
+            if not f'{object_tag.data.get("description")}'.startswith(primary_tag_name):
+                continue
+
+            if NetBoxObject.extract_tag_name(object_tag) not in new_object_tags:
+                device_vm_object.remove_tags(object_tag)
+
+        # update VM disk data information
+        if version.parse(self.inventory.netbox_api_version) >= version.parse("3.7.0") and \
+                object_type == NBVM and disk_data is not None and len(disk_data) > 0:
+
+            # create pairs of existing and discovered disks.
+            # currently these disks are only used within the VM model. that's we we use this simple approach and
+            # just rewrite disk as they appear in order.
+            # otherwise we would need to implement a matching function like matching interfaces.
+            disk_zip_list = zip_longest(
+                sorted(device_vm_object.get_virtual_disks(), key=lambda x: grab(x, "data.name")),
+                sorted(disk_data, key=lambda x: x.get("name")),
+                fillvalue="X")
+
+            for existing, discovered in disk_zip_list:
+                if existing == "X":
+                    self.inventory.add_object(NBVirtualDisk, source=self,
+                                              data={**discovered, **{"virtual_machine": device_vm_object}}, )
+                elif discovered == "X":
+                    log.info(f"{existing.name} '{existing.get_display_name(including_second_key=True)}' has been deleted")
+                    existing.deleted = True
+                else:
+                    existing.update(data=discovered, source=self)
 
         # compile all nic data into one dictionary
         if object_type == NBVM:
@@ -1702,6 +1765,12 @@ class VMWareHandler(SourceBase):
             if pnic_link_speed is None:
                 pnic_link_speed = grab(pnic, "validLinkSpecification.0.speedMb")
 
+            pnic_link_duplex = grab(pnic, "linkSpeed.duplex")
+            if pnic_link_duplex is None:
+                pnic_link_duplex = grab(pnic, "spec.linkSpeed.duplex")
+            if pnic_link_duplex is None:
+                pnic_link_duplex = grab(pnic, "validLinkSpecification.0.duplex")
+
             # determine link speed text
             pnic_description = ""
             if pnic_link_speed is not None:
@@ -1764,6 +1833,13 @@ class VMWareHandler(SourceBase):
                 pnic_data["mtu"] = pnic_mtu
             if pnic_mode is not None:
                 pnic_data["mode"] = pnic_mode
+
+            # add link speed and duplex attributes
+            if version.parse(self.inventory.netbox_api_version) >= version.parse("3.2.0"):
+                if pnic_link_speed is not None:
+                    pnic_data["speed"] = pnic_link_speed * 1000
+                if pnic_link_duplex is not None:
+                    pnic_data["duplex"] = "full" if pnic_link_duplex is True else "half"
 
             # determine interface mode for non VM traffic NICs
             if len(pnic_vlans) > 0:
@@ -2076,10 +2152,6 @@ class VMWareHandler(SourceBase):
 
         hardware_devices = grab(obj, "config.hardware.device", fallback=list())
 
-        disk = int(sum([getattr(comp, "capacityInKB", 0) for comp in hardware_devices
-                       if isinstance(comp, vim.vm.device.VirtualDisk)
-                        ]) / 1024 / 1024)
-
         annotation = None
         if self.settings.skip_vm_comments is False:
             annotation = get_string_or_none(grab(obj, "config.annotation"))
@@ -2098,8 +2170,7 @@ class VMWareHandler(SourceBase):
             "cluster": nb_cluster_object,
             "status": status,
             "memory": grab(obj, "config.hardware.memoryMB"),
-            "vcpus": grab(obj, "config.hardware.numCPU"),
-            "disk": disk
+            "vcpus": grab(obj, "config.hardware.numCPU")
         }
 
         # Add adaption for change in NetBox 3.3.0 VM model
@@ -2109,6 +2180,12 @@ class VMWareHandler(SourceBase):
 
             if self.settings.track_vm_host:
                 vm_data["device"] = self.get_object_from_cache(parent_host)
+
+        # Add adaption for added virtual disks in NetBox 3.7.0
+        if version.parse(self.inventory.netbox_api_version) < version.parse("3.7.0"):
+            vm_data["disk"] = int(sum([getattr(comp, "capacityInKB", 0) for comp in hardware_devices
+                                       if isinstance(comp, vim.vm.device.VirtualDisk)
+                                       ]) / 1024 / 1024)
 
         if platform is not None:
             vm_data["platform"] = {"name": platform}
@@ -2154,12 +2231,46 @@ class VMWareHandler(SourceBase):
 
         nic_data = dict()
         nic_ips = dict()
+        disk_data = list()
 
         # track MAC addresses in order add dummy guest interfaces
         processed_interface_macs = list()
 
         # get VM interfaces
         for vm_device in hardware_devices:
+
+            if isinstance(vm_device, vim.vm.device.VirtualDisk):
+
+                vm_device_backing = vm_device.backing
+                while grab(vm_device_backing, "parent") is not None:
+                    vm_device_backing = vm_device_backing.parent
+
+                vm_device_description = list()
+                if grab(vm_device, 'backing.diskMode') is not None:
+                    vm_device_description.append(
+                        str(grab(vm_device, 'backing.diskMode')).capitalize().replace("_", "-"))
+
+                if grab(vm_device, 'backing.thinProvisioned') is True:
+                    vm_device_description.append("ThinProvisioned")
+                else:
+                    vm_device_description.append("ThickProvisioned")
+
+                if grab(vm_device_backing, "fileName") is not None:
+                    vm_device_description.append(grab(vm_device_backing, "fileName"))
+
+                disk_size = grab(vm_device, "capacityInKB", fallback=0)
+                disk_size_in_gb = int(disk_size / 1024 / 1024)
+                if disk_size_in_gb < 1:
+                    vm_device_description.append(f"Size: {int(disk_size / 1024)} MB")
+                    disk_size_in_gb = 1
+
+                disk_data.append({
+                    "name": grab(vm_device, "deviceInfo.label"),
+                    "size": disk_size_in_gb,
+                    "description": " / ".join(vm_device_description)
+                })
+
+                continue
 
             # sample: https://github.com/vmware/pyvmomi-community-samples/blob/master/samples/getvnicinfo.py
 
@@ -2376,7 +2487,7 @@ class VMWareHandler(SourceBase):
         # add VM to inventory
         self.add_device_vm_to_inventory(NBVM, object_data=vm_data, vnic_data=nic_data,
                                         nic_ips=nic_ips, p_ipv4=vm_primary_ip4, p_ipv6=vm_primary_ip6,
-                                        vmware_object=obj)
+                                        vmware_object=obj, disk_data=disk_data)
 
         return
 

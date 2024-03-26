@@ -44,7 +44,7 @@ class NetBoxHandler:
     minimum_api_version = "2.9"
 
     # This tag gets added to all objects create/updated/inherited by this program
-    primary_tag = "NetBox-synced"
+    primary_tag = primary_tag_name
 
     # all objects which have a primary tag but not present in any source anymore will get this tag assigned
     orphaned_tag = f"{primary_tag}: Orphaned"
@@ -397,6 +397,10 @@ class NetBoxHandler:
             if nb_object_class in self.resolved_dependencies:
                 continue
 
+            # make sure to query only available object types
+            if version.parse(self.inventory.netbox_api_version) < version.parse(nb_object_class.min_netbox_version):
+                continue
+
             # initialize cache variables
             cached_nb_data = list()
             cache_file = f"{self.cache_directory}{os.sep}{nb_object_class.__name__}.cache"
@@ -531,12 +535,18 @@ class NetBoxHandler:
             prune_text = f"Objects would be automatically removed after {self.settings.prune_delay_in_days} days " \
                          f"but pruning is currently disabled."
 
-        self.inventory.add_update_object(NBTag, data={
-            "name": self.orphaned_tag,
-            "color": "607d8b",
-            "description": "A source which has previously provided this object no "
-                           f"longer states it exists. {prune_text}"
-        })
+        orphaned_tag_object = self.inventory.add_update_object(NBTag, data={"name": self.orphaned_tag})
+
+        if orphaned_tag_object is not None:
+            orphaned_tag_data = {
+                "name": self.orphaned_tag,
+                "description": "A source which has previously provided this object no "
+                               f"longer states it exists. {prune_text}"
+            }
+            if orphaned_tag_object.is_new is True:
+                orphaned_tag_data["color"] = "607d8a"
+
+            orphaned_tag_object.update(data=orphaned_tag_data)
 
         self.inventory.add_update_object(NBTag, data={
             "name": self.primary_tag,
@@ -561,6 +571,10 @@ class NetBoxHandler:
             True if this will be the last update run. Needed to assign primary_ip4/6 properly
 
         """
+
+        # make sure to query only available object types
+        if version.parse(self.inventory.netbox_api_version) < version.parse(nb_object_sub_class.min_netbox_version):
+            return
 
         for this_object in self.inventory.get_all_items(nb_object_sub_class):
 
@@ -614,6 +628,13 @@ class NetBoxHandler:
 
                     else:
                         data_to_patch[key] = value
+
+            # special case for IP address
+            if isinstance(this_object, NBIPAddress):
+                # if object is new and and has no id, then we need to remove assigned_object_type from data_to_patch
+                if "assigned_object_id" in unresolved_dependency_data.keys() and \
+                        "assigned_object_type" in data_to_patch.keys():
+                    del data_to_patch["assigned_object_type"]
 
             issued_request = False
             returned_object_data = None
@@ -862,5 +883,26 @@ class NetBoxHandler:
             log.warning("Unfortunately we were not able to delete all objects. Sorry")
 
         return
+
+    def delete_unused_tags(self):
+        """
+        deletes all tags with primary tag in description and the attribute 'tagged_items' returned 0
+        """
+
+        self.query_current_data([NBTag])
+
+        for this_tag in self.inventory.get_all_items(NBTag):
+
+            tag_description = grab(this_tag, "data.description")
+            tag_tagged_items = grab(this_tag, "data.tagged_items")
+
+            if tag_description is None or not tag_description.startswith(self.primary_tag):
+                continue
+
+            if tag_tagged_items is None or tag_tagged_items != 0:
+                continue
+
+            log.info(f"Deleting unused tag '{this_tag.get_display_name()}'")
+            self.request(NBTag, req_type="DELETE", nb_id=this_tag.nb_id)
 
 # EOF

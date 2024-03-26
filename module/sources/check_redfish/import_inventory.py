@@ -58,6 +58,7 @@ class CheckRedfish(SourceBase):
 
     device_object = None
     inventory_file_content = None
+    manager_name = None
 
     def __init__(self, name=None):
 
@@ -110,22 +111,34 @@ class CheckRedfish(SourceBase):
             try:
                 inventory_id = int(inventory_id)
             except (ValueError, TypeError):
-                log.error(f"Value for meta.inventory_id '{inventory_id}' must be an integer. "
-                          f"Cannot use inventory_id to match device in NetBox.")
+                log.warning(f"Value for meta.inventory_id '{inventory_id}' must be an integer. "
+                            f"Cannot use inventory_id to match device in NetBox.")
 
             self.device_object = self.inventory.get_by_id(NBDevice, inventory_id)
 
-            # try to find device by serial of first system in inventory
-            device_serial = grab(self.inventory_file_content, "inventory.system.0.serial")
-            if self.device_object is None:
-                self.device_object = self.inventory.get_by_data(NBDevice, data={
-                    "serial": device_serial
-                })
+            if self.device_object is not None:
+                log.debug2("Found a matching %s object '%s' based on inventory id '%d'" %
+                           (self.device_object.name,
+                            self.device_object.get_display_name(including_second_key=True),
+                            inventory_id))
 
-            if self.device_object is None:
-                log.error(f"Unable to find {NBDevice.name} with id '{inventory_id}' or "
-                          f"serial '{device_serial}' in NetBox inventory from inventory file {filename}")
-                continue
+            else:
+                # try to find device by serial of first system in inventory
+                device_serial = grab(self.inventory_file_content, "inventory.system.0.serial")
+                if self.device_object is None:
+                    self.device_object = self.inventory.get_by_data(NBDevice, data={
+                        "serial": device_serial
+                    })
+
+                if self.device_object is None:
+                    log.error(f"Unable to find {NBDevice.name} with id '{inventory_id}' or "
+                              f"serial '{device_serial}' in NetBox inventory from inventory file {filename}")
+                    continue
+                else:
+                    log.debug2("Found a matching %s object '%s' based on serial '%s'" %
+                               (self.device_object.name,
+                                self.device_object.get_display_name(including_second_key=True),
+                                device_serial))
 
             # parse all components
             self.update_device()
@@ -133,12 +146,12 @@ class CheckRedfish(SourceBase):
             self.update_fan()
             self.update_memory()
             self.update_proc()
+            self.update_manager()               # reads manager name to set it via update_network_interface for BMC
             self.update_physical_drive()
             self.update_storage_controller()
             self.update_storage_enclosure()
             self.update_network_adapter()
             self.update_network_interface()
-            self.update_manager()
 
     def reset_inventory_state(self):
         """
@@ -147,6 +160,7 @@ class CheckRedfish(SourceBase):
 
         self.inventory_file_content = None
         self.device_object = None
+        self.manager_name = None
 
         # reset interface types
         self.interface_adapter_type_dict = dict()
@@ -708,6 +722,8 @@ class CheckRedfish(SourceBase):
             hostname = get_string_or_none(grab(nic_port, "hostname"))
             health_status = get_string_or_none(grab(nic_port, "health_status"))
             adapter_id = get_string_or_none(grab(nic_port, "adapter_id"))
+            link_speed = grab(nic_port, "capable_speed") or grab(nic_port, "current_speed") or 0
+            link_duplex = grab(nic_port, "full_duplex")
 
             mac_address = None
             wwn = None
@@ -736,9 +752,6 @@ class CheckRedfish(SourceBase):
             else:
                 port_name = port_id
 
-            # get port speed
-            link_speed = grab(nic_port, "capable_speed") or grab(nic_port, "current_speed") or 0
-
             if link_speed == 0 and adapter_id is not None:
                 link_type = self.interface_adapter_type_dict.get(adapter_id)
             else:
@@ -755,9 +768,14 @@ class CheckRedfish(SourceBase):
 
             # get enabled state
             enabled = False
+
             # assume that a mgmt_only interface is always enabled as we retrieved data via redfish
             if "up" in f"{link_status}".lower() or mgmt_only is True:
                 enabled = True
+
+            # set BMC interface to manager name
+            if mgmt_only is True and self.manager_name is not None:
+                port_name = f"{self.manager_name} ({port_id})"
 
             port_data_dict[port_name] = {
                 "inventory_type": "NIC Port",
@@ -765,11 +783,22 @@ class CheckRedfish(SourceBase):
                 "mac_address": mac_address,
                 "wwn": wwn,
                 "enabled": enabled,
-                "description": ", ".join(description),
                 "type": link_type.get_this_netbox_type(),
                 "mgmt_only": mgmt_only,
                 "health": health_status
             }
+
+            if len(description) > 0:
+                port_data_dict[port_name]["description"] = ", ".join(description)
+            if mgmt_only is True:
+                port_data_dict[port_name]["mode"] = "access"
+
+            # add link speed and duplex attributes
+            if version.parse(self.inventory.netbox_api_version) >= version.parse("3.2.0"):
+                if link_speed > 0:
+                    port_data_dict[port_name]["speed"] = link_speed * 1000
+                if link_duplex is not None:
+                    port_data_dict[port_name]["duplex"] = "full" if link_duplex is True else "half"
 
             # collect ip addresses
             nic_ips[port_name] = list()
@@ -785,7 +814,7 @@ class CheckRedfish(SourceBase):
 
                 nic_ips[port_name].append(ipv6_address)
 
-        data = self.map_object_interfaces_to_current_interfaces(self.device_object, port_data_dict)
+        data = self.map_object_interfaces_to_current_interfaces(self.device_object, port_data_dict, True)
 
         for port_name, port_data in port_data_dict.items():
 
@@ -820,8 +849,7 @@ class CheckRedfish(SourceBase):
 
                 data_to_update["mgmt_only"] = mgmt_only
 
-                # update nic object
-                nic_object.update(data=data_to_update, source=self)
+                port_data = data_to_update
 
             self.add_update_interface(nic_object, self.device_object, port_data, nic_ips.get(port_name, list()))
 
@@ -839,6 +867,9 @@ class CheckRedfish(SourceBase):
 
             if model is not None and model not in name:
                 name += f" {model}"
+
+            if self.manager_name is None:
+                self.manager_name = name
 
             description = None
             if len(licenses) > 0:

@@ -230,6 +230,8 @@ class NetBoxObject:
             name of the data model key which represents the secondary key of this object besides id
         enforce_secondary_key:
             bool if secondary key of an object shall be added to name when get_display_name() method is called
+        min_netbox_version:
+            defines since which NetBox version this object is available
 
     The data_model attribute needs to be a dict describing the data model in NetBox.
     Key must be string.
@@ -257,6 +259,7 @@ class NetBoxObject:
     api_path = ""
     primary_key = ""
     data_model = {}
+    min_netbox_version = "0.0"
     # _mandatory_attrs must be set at subclasses
     _mandatory_attrs = ("name", "api_path", "primary_key", "data_model")
 
@@ -454,8 +457,7 @@ class NetBoxObject:
 
             return
 
-        if source is not None:
-            self.source = source
+        self.set_source(source)
 
         display_name = self.get_display_name(data)
 
@@ -542,15 +544,23 @@ class NetBoxObject:
                 if type_check_failed is True:
                     continue
 
+            # allows an empty site for netbox objects where a site is not mandatory
+            # required for clusters and sub-objects without site reference
+            if isinstance(self, (NBCluster, NBVM, NBVLAN)) and \
+                    key == "site" and \
+                    "name" in value and value.get("name") is None:
+                parsed_data[key] = None
+                continue
+
             # this is meant to be reference to a different object
             if defined_value_type in NetBoxObject.__subclasses__() and defined_value_type != NBCustomField:
 
                 if not isinstance(value, NetBoxObject):
                     # try to find object.
-                    value = self.inventory.add_update_object(defined_value_type, data=value)
-                    # add source if item was created via this source
-                    if value.source is None:
-                        value.source = source
+                    value = self.inventory.add_update_object(defined_value_type, data=value, source=source)
+
+                # add source if currently undefined (read from NetBox)
+                value.set_source(source)
 
             # add to parsed data dict
             parsed_data[key] = value
@@ -642,6 +652,14 @@ class NetBoxObject:
 
         if data_updated is True and self.is_new is False:
             log.debug("Updated %s object: %s" % (self.name, self.get_display_name()))
+
+    def set_source(self, source=None):
+        """
+        updates the source attribute, Only update if undefined
+        """
+
+        if source is not None and self.source is None:
+            self.source = source
 
     def get_display_name(self, data=None, including_second_key=False):
         """
@@ -773,7 +791,7 @@ class NetBoxObject:
 
         return r
 
-    def get_tags(self):
+    def get_tags(self) -> list:
         """
         returns a list of strings of tag names
 
@@ -783,6 +801,7 @@ class NetBoxObject:
         """
 
         tag_list = list()
+
         if "tags" not in self.data_model.keys():
             return tag_list
 
@@ -794,7 +813,18 @@ class NetBoxObject:
             else:
                 log.error(f"This tag is not an NetBox object: {tag}")
                 log.error(f"Please report this here: https://github.com/bb-Ricardo/netbox-sync/issues/120")
+
         return tag_list
+
+    @classmethod
+    def extract_tag_name(cls, this_tag):
+
+        if isinstance(this_tag, NBTag):
+            return this_tag.get_display_name()
+        elif isinstance(this_tag, str):
+            return this_tag
+        elif isinstance(this_tag, dict) and this_tag.get("name") is not None:
+            return this_tag.get("name")
 
     def compile_tags(self, tags, remove=False):
         """
@@ -824,20 +854,13 @@ class NetBoxObject:
 
         new_tag_list = NBTagList()
 
-        def extract_tags(this_tags):
-            if isinstance(this_tags, NBTag):
-                sanitized_tag_strings.append(this_tags.get_display_name())
-            elif isinstance(this_tags, str):
-                sanitized_tag_strings.append(this_tags)
-            elif isinstance(this_tags, dict) and this_tags.get("name") is not None:
-                sanitized_tag_strings.append(this_tags.get("name"))
-
         if isinstance(tags, list):
             for tag in tags:
-                extract_tags(tag)
+                sanitized_tag_strings.append(self.extract_tag_name(tag))
+
         else:
             # noinspection PyTypeChecker
-            extract_tags(tags)
+            sanitized_tag_strings.append(self.extract_tag_name(tags))
 
         # current list of tag strings
         current_tag_strings = self.get_tags()
@@ -846,6 +869,9 @@ class NetBoxObject:
         removed_tags = list()
 
         for tag_name in sanitized_tag_strings:
+
+            if tag_name is None:
+                continue
 
             # add tag
             if tag_name not in current_tag_strings and remove is False:
@@ -978,6 +1004,9 @@ class NetBoxObject:
             else:
                 log.error(f"Unable to parse provided VLAN data: {vlan}")
                 continue
+
+            # set source for this vlan if undefined
+            new_vlan_object.set_source(self.source)
 
             # VLAN already in list, must have been submitted twice
             if new_vlan_object in new_vlan_list:
@@ -1187,7 +1216,8 @@ class NBTag(NetBoxObject):
             "name": 100,
             "slug": 100,
             "color": 6,
-            "description": 200
+            "description": 200,
+            "tagged_items": int
         }
         super().__init__(*args, **kwargs)
 
@@ -1562,6 +1592,14 @@ class NBVM(NetBoxObject):
         }
         super().__init__(*args, **kwargs)
 
+    def get_virtual_disks(self):
+        result_list = list()
+        for ip_object in self.inventory.get_all_items(NBVirtualDisk):
+            if grab(ip_object, "data.virtual_machine") == self:
+                result_list.append(ip_object)
+
+        return result_list
+
 
 class NBVMInterface(NetBoxObject):
     name = "virtual machine interface"
@@ -1616,11 +1654,14 @@ class NBInterface(NetBoxObject):
             "mgmt_only": bool,
             "mtu": int,
             "mode": ["access", "tagged", "tagged-all"],
+            "speed": int,
+            "duplex": ["half", "full", "auto"],
             "untagged_vlan": NBVLAN,
             "tagged_vlans": NBVLANList,
             "description": 200,
             "connection_status": bool,
-            "tags": NBTagList
+            "tags": NBTagList,
+            "parent": object
         }
         super().__init__(*args, **kwargs)
 
@@ -1632,6 +1673,34 @@ class NBInterface(NetBoxObject):
                 result_list.append(ip_object)
 
         return result_list
+
+    def update(self, data=None, read_from_netbox=False, source=None):
+
+        # remove definition of interface type if a parent interface is set as it only supports virtual types
+        if grab(self, "data.parent") is not None and data.get("type") is not None:
+            log.debug2(f"{self.name} '{self.get_display_name()}' attribute 'parent' is set. "
+                       f"Removing type {data.get('type')} from update request")
+            del data["type"]
+
+        super().update(data=data, read_from_netbox=read_from_netbox, source=source)
+
+
+class NBVirtualDisk(NetBoxObject):
+    name = "Virtual Disk"
+    api_path = "virtualization/virtual-disks"
+    primary_key = "name"
+    secondary_key = "virtual_machine"
+    min_netbox_version = "3.7"
+
+    def __init__(self, *args, **kwargs):
+        self.data_model = {
+            "name": 64,
+            "virtual_machine": NBVM,
+            "description": 200,
+            "size": int,  # in GB
+            "tags": NBTagList
+        }
+        super().__init__(*args, **kwargs)
 
 
 class NBIPAddress(NetBoxObject):
@@ -1713,6 +1782,11 @@ class NBIPAddress(NetBoxObject):
         # we need to tell NetBox which object type this is meant to be
         if "assigned_object_id" in self.updated_items:
             self.updated_items.append("assigned_object_type")
+
+        # if ip association has been removed we also need to get rid of object type
+        if "assigned_object_type" in self.updated_items and self.data.get("assigned_object_id") is None \
+                and "assigned_object_type" in self.updated_items:
+            self.updated_items.remove("assigned_object_type")
 
         if assigned_object is None or previous_ip_device_vm is None:
             return

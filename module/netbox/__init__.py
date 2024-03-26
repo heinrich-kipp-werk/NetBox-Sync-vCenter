@@ -30,9 +30,12 @@ from module.netbox.object_classes import (
     NBDevice,
     NBVM,
     NBVMInterface,
+    NBVirtualDisk,
     NBInterface,
     NBIPAddress,
     NBFHRPGroupItem,
     NBInventoryItem,
     NBPowerPort
 )
+
+primary_tag_name = "NetBox-synced"

@@ -10,10 +10,12 @@
 import re
 
 from ipaddress import ip_interface, ip_address, IPv6Address, IPv4Address, IPv6Network, IPv4Network
+from typing import List
 
 from module.netbox import *
 from module.common.logging import get_logger
 from module.common.misc import grab
+from module.sources.common.excluded_vlan import ExcludedVLANName, ExcludedVLANID
 
 log = get_logger()
 
@@ -44,7 +46,8 @@ class SourceBase:
     def finish(self):
         pass
 
-    def map_object_interfaces_to_current_interfaces(self, device_vm_object, interface_data_dict=None):
+    def map_object_interfaces_to_current_interfaces(self, device_vm_object, interface_data_dict=None,
+                                                    append_unmatched_interfaces=False):
         """
         Try to match current object interfaces to discovered ones. This will be done
         by multiple approaches. Order as following listing whatever matches first will be chosen.
@@ -71,6 +74,8 @@ class SourceBase:
             object type to look for
         interface_data_dict: dict
             dictionary with interface data to compare to existing machine
+        append_unmatched_interfaces: bool
+            if True add unmatched interfaces as new interfaces instead of trying to assign to en unmatched on
 
         Returns
         -------
@@ -161,12 +166,17 @@ class SourceBase:
         current_object_interface_names.sort()
         unmatched_interface_names.sort()
 
-        matching_nics = dict(zip(unmatched_interface_names, current_object_interface_names))
+        # Don't match to existing interfaces, just append additionally to list of interfaces
+        if append_unmatched_interfaces is True:
+            for int_name in unmatched_interface_names:
+                return_data[int_name] = None
+        else:
+            matching_nics = dict(zip(unmatched_interface_names, current_object_interface_names))
 
-        for new_int, current_int in matching_nics.items():
-            current_int_object = current_object_interfaces.get(current_int)
-            log.debug2(f"Matching '{new_int}' to NetBox Interface '{current_int_object.get_display_name()}'")
-            return_data[new_int] = current_int_object
+            for new_int, current_int in matching_nics.items():
+                current_int_object = current_object_interfaces.get(current_int)
+                log.debug2(f"Matching '{new_int}' to NetBox Interface '{current_int_object.get_display_name()}'")
+                return_data[new_int] = current_int_object
 
         return return_data
 
@@ -254,10 +264,6 @@ class SourceBase:
             tuple with interface object that was added/updated and a list of ip address objects which were
             added to this interface
         """
-
-        disable_vlan_sync = False
-        if "disable_vlan_sync" in self.settings:
-            disable_vlan_sync = self.settings.disable_vlan_sync
 
         ip_tenant_inheritance_order = None
         if "ip_tenant_inheritance_order" in self.settings:
@@ -401,7 +407,18 @@ class SourceBase:
                 # continue if
                 #   * both are in global scope
                 #   * both are part of the same vrf
-                if possible_ip_vrf != grab(ip, "data.vrf"):
+                current_vrf = grab(ip, "data.vrf")
+                if possible_ip_vrf != current_vrf:
+                    possible_ip_vrf_str = possible_ip_vrf if not isinstance(possible_ip_vrf, NetBoxObject) \
+                        else possible_ip_vrf.get_display_name()
+                    current_vrf_str = current_vrf if not isinstance(current_vrf, NetBoxObject) \
+                        else current_vrf.get_display_name()
+                    current_ip_nic_str = "" if not isinstance(current_ip_nic, NetBoxObject) else \
+                        " "+current_ip_nic.get_display_name()
+
+                    log.warning(f"Possibly wrongly assigned VRF for{current_ip_nic_str} IP "
+                                f"'{ip_address_string}'. Current VRF '{current_vrf_str}' and "
+                                f"possible VRF '{possible_ip_vrf_str}'")
                     continue
 
                 # IP address is not assigned to any interface
@@ -540,14 +557,14 @@ class SourceBase:
             if grab(prefix_vlan, "data.vid") in tagged_vlan_ids:
                 matching_tagged_vlans[grab(prefix_vlan, "data.vid")] = prefix_vlan
 
-        # try to find vlan object if no matching prefix VLAN ws found
+        # try to find vlan object if no matching prefix VLAN was found
         vlan_interface_data = dict()
         if untagged_vlan is not None or (untagged_vlan is None and len(tagged_vlans) == 0):
             if matching_untagged_vlan is None and untagged_vlan is not None:
                 matching_untagged_vlan = self.get_vlan_object_if_exists(untagged_vlan, site_name)
 
                 # don't sync newly discovered VLANs to NetBox
-                if disable_vlan_sync is True and not isinstance(matching_untagged_vlan, NetBoxObject):
+                if self.add_vlan_object_to_netbox(matching_untagged_vlan, site_name) is False:
                     matching_untagged_vlan = None
 
             elif matching_untagged_vlan is not None:
@@ -555,7 +572,6 @@ class SourceBase:
                            f"untagged interface VLAN.")
 
             if matching_untagged_vlan is not None:
-
                 vlan_interface_data["untagged_vlan"] = matching_untagged_vlan
                 if grab(interface_object, "data.mode") is None:
                     vlan_interface_data["mode"] = "access"
@@ -571,7 +587,7 @@ class SourceBase:
                 matching_tagged_vlan = self.get_vlan_object_if_exists(tagged_vlan, site_name)
 
                 # don't sync newly discovered VLANs to NetBox
-                if disable_vlan_sync is True and not isinstance(matching_tagged_vlan, NetBoxObject):
+                if self.add_vlan_object_to_netbox(matching_tagged_vlan, site_name) is False:
                     matching_tagged_vlan = None
 
             if matching_tagged_vlan is not None:
@@ -690,6 +706,66 @@ class SourceBase:
             log.debug2("No matching existing VLAN found for this VLAN id.")
 
         return return_data
+
+    def add_vlan_object_to_netbox(self, vlan_data, site_name=None):
+        """
+        Determines if a newly discovered VLAN should be synced to NetBox or not
+
+        Parameters
+        ----------
+        vlan_data: dict, NetBoxVLAN
+            dict with NBVLAN data attributes
+        site_name: str
+            name of site the VLAN could be present
+
+        Returns
+        -------
+        Bool: True or False based on config settings
+
+        """
+
+        # get config data
+        disable_vlan_sync = False
+        vlan_sync_exclude_by_name: List[ExcludedVLANName] = list()
+        vlan_sync_exclude_by_id: List[ExcludedVLANID] = list()
+        if "disable_vlan_sync" in self.settings:
+            disable_vlan_sync = self.settings.disable_vlan_sync
+        if "vlan_sync_exclude_by_name" in self.settings:
+            vlan_sync_exclude_by_name = self.settings.vlan_sync_exclude_by_name
+        if "vlan_sync_exclude_by_id" in self.settings:
+            vlan_sync_exclude_by_id = self.settings.vlan_sync_exclude_by_id
+
+        # VLAN is already an existing NetBox VLAN, then it can be reused
+        if isinstance(vlan_data, NetBoxObject):
+            return True
+
+        if vlan_data is None:
+            return False
+
+        if disable_vlan_sync is True:
+            return False
+
+        # get VLAN details
+        vlan_name = vlan_data.get("name")
+        vlan_id = vlan_data.get("vid")
+
+        if vlan_id == 4095:
+            log.debug(f"Skipping sync of VLAN '{vlan_name}' ID: '{vlan_id}' (VMware 'Virtual Guest Tagging') to NetBox")
+            return False
+
+        if vlan_id >= 4096:
+            log.warning(f"Skipping sync of invalid VLAN '{vlan_name}' ID: '{vlan_id}'")
+            return False
+
+        for excluded_vlan in vlan_sync_exclude_by_name or list():
+            if excluded_vlan.matches(vlan_name, site_name):
+                return False
+
+        for excluded_vlan in vlan_sync_exclude_by_id or list():
+            if excluded_vlan.matches(vlan_id, site_name):
+                return False
+
+        return True
 
     def add_update_custom_field(self, data) -> NBCustomField:
         """
