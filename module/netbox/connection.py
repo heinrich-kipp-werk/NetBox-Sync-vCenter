@@ -789,7 +789,7 @@ class NetBoxHandler:
                 days_since_last_update = (today - last_updated).days
 
                 # it seems we need to delete this object
-                if last_updated is not None and days_since_last_update >= self.settings.prune_delay_in_days:
+                if last_updated is not None and days_since_last_update >= self.settings.prune_delay_in_days and nb_object_sub_class.name != "device":
 
                     log.info(f"{nb_object_sub_class.name.capitalize()} '{this_object.get_display_name()}' is orphaned "
                              f"for {days_since_last_update} days and will be deleted.")
